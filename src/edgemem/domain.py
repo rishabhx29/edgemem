@@ -203,15 +203,41 @@ class Claim:
 
     quarantine_reason: str | None = None
 
+    def __post_init__(self) -> None:
+        # Claims arrive from a depot over a sync, so they are untrusted input.
+        # Coerce the enums rather than trusting the caller to have used them:
+        # a bare string that slips through would make is_quarantined() lie.
+        object.__setattr__(
+            self, "trust", Trust(self.trust)
+        )
+        object.__setattr__(
+            self, "source_class", AuthorityClass(self.source_class)
+        )
+        if isinstance(self.causal, dict):
+            object.__setattr__(self, "causal", CausalContext(self.causal))
+        for name in ("sensitivity", "salience", "urgency"):
+            object.__setattr__(self, name, float(getattr(self, name)))
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(
+                    f"{name} must be between 0.0 and 1.0, got {getattr(self, name)!r}"
+                )
+
     def with_trust(self, trust: Trust, reason: str | None) -> "Claim":
         return replace(self, trust=trust, quarantine_reason=reason)
 
     def is_quarantined(self) -> bool:
-        return self.trust is Trust.QUARANTINED
+        return self.trust == Trust.QUARANTINED
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialise for the vector store. Every field is indexed, not embedded."""
+        """Serialise for the vector store. Every field is indexed, not embedded.
+
+        The claim id travels in the payload as well as being used to derive the
+        point id. The point id is a storage key the store chose; the claim id is
+        the claim's identity. Keeping them apart means a read path never has to
+        guess that a numeric id is the claim's own.
+        """
         return {
+            "claim_id": self.claim_id,
             "subject": self.subject,
             "attribute": self.attribute,
             "value": self.value,
@@ -234,8 +260,14 @@ class Claim:
     def from_payload(
         claim_id: str, payload: dict[str, Any]
     ) -> "Claim":
+        """Rebuild a claim.
+
+        Prefers the claim id carried in the payload, because a caller reading
+        from the store has only the record in hand. The argument is the
+        fallback for a payload that predates the field.
+        """
         return Claim(
-            claim_id=claim_id,
+            claim_id=payload.get("claim_id") or claim_id,
             subject=payload["subject"],
             attribute=payload["attribute"],
             value=payload["value"],
