@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Local scratch / probe output
+var/
+
+# Agent tooling that is installed, not source. These are not part of the project.
+.agents/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
