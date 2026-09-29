@@ -238,18 +238,43 @@ class ResidencyPolicy:
             policy_version=self.policy_version,
         )
 
+    def plan(
+        self, claims: Iterable[Claim], context: ResidencyContext
+    ) -> list[tuple[Claim, ResidencyReason]]:
+        """Classify a set of claims against one shared allowance.
+
+        The allowance is spent as it is committed. Classifying each claim
+        independently against the same context would let a set of individually
+        affordable claims add up to several times the allowance — which is the
+        failure "a byte budget the device respects" is supposed to prevent.
+
+        Order is preserved. Later claims see less headroom than earlier ones, and
+        the reason for each says so.
+        """
+        planned: list[tuple[Claim, ResidencyReason]] = []
+        remaining = context.remaining_bytes
+        for claim in claims:
+            cost = estimate_outbound_bytes(claim)
+            spent_context = replace(context, remaining_bytes=remaining)
+            reason = self.decide(claim, spent_context)
+            if reason.residency is Residency.SYNC:
+                remaining = max(0, remaining - cost)
+            planned.append((claim, reason))
+        return planned
+
     def planned_outbound_bytes(
         self, claims: Iterable[Claim], context: ResidencyContext
     ) -> int:
         """What a set of claims would cost the allowance under this policy.
 
         The figure a fleet operator wants before adopting a policy: the cost of
-        the policy, measured by what it would actually move.
+        the policy, measured by what it would actually move. Never exceeds the
+        spendable allowance.
         """
         return sum(
             estimate_outbound_bytes(c)
-            for c in claims
-            if self.decide(c, context).residency is Residency.SYNC
+            for c, r in self.plan(claims, context)
+            if r.residency is Residency.SYNC
         )
 
     # -- tuning ------------------------------------------------------------

@@ -14,7 +14,6 @@ serialises writes behind a lock.
 from __future__ import annotations
 
 import hashlib
-import json
 import shutil
 import threading
 import time
@@ -88,10 +87,6 @@ class IndexState:
             f"scanning ({self.indexed_vectors}/{self.points} indexed, "
             f"{self.segments} segments)"
         )
-
-
-def _count_payload_bytes(payload: dict[str, Any]) -> int:
-    return len(json.dumps(payload, default=str).encode("utf-8"))
 
 
 class ShardStore:
