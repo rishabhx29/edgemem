@@ -20,89 +20,46 @@ Four verdicts, and the engine chooses between them:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
 
 from edgemem.domain import (
-    AuthorityClass,
-    AuthorityView,
     CausalContext,
     CitedClaim,
     Claim,
     ConflictSide,
+    Ladder,
     NeededClaim,
     Residency,
     ResidencyReason,
     Trust,
     Verdict,
     VerdictKind,
+    default_ladder,
     utcnow,
 )
+from edgemem.outbox import Outbox
 from edgemem.residency import (
     DEFAULT_POLICY,
     ResidencyContext,
     ResidencyPolicy,
     estimate_outbound_bytes,
 )
+from edgemem.schema import DEFAULT_PACK, SchemaPack
 from edgemem.store import ShardStore
 
-
-def default_ladder() -> tuple[tuple[AuthorityClass, int], ...]:
-    """Source classes in descending order of entitlement to be believed.
-
-    Data, not code. A deployment replaces it; the engine does not change.
-    Recency is not a member of this ordering and is not consulted.
-    """
-    return (
-        (AuthorityClass.INSTRUMENT, 100),
-        (AuthorityClass.ATTESTED_HUMAN, 80),
-        (AuthorityClass.UNATTESTED_HUMAN, 50),
-        (AuthorityClass.THIRD_PARTY_FEED, 30),
-        (AuthorityClass.RUMOUR, 10),
-    )
-
-
-@dataclass
-class Ladder:
-    """A versioned ordering of who could settle a conflict."""
-
-    version: str = "v1"
-    entries: tuple[tuple[AuthorityClass, int], ...] = default_ladder()
-
-    def rank(self, source_class: AuthorityClass) -> int:
-        for cls, weight in self.entries:
-            if cls is source_class:
-                return weight
-        return 0
-
-    def ordered(self) -> tuple[str, ...]:
-        return tuple(cls.value for cls, _ in self.entries)
-
-    def entitling_class(self, sides: Iterable[Claim]) -> str | None:
-        """The highest-ranked source class present among the sides.
-
-        Reported, never applied. The engine escalates; a person decides.
-        """
-        best: str | None = None
-        best_rank = -1
-        for claim in sides:
-            rank = self.rank(claim.source_class)
-            if rank > best_rank:
-                best_rank, best = rank, claim.source_class.value
-        return best
-
-    def view(self, sides: Iterable[Claim]) -> AuthorityView:
-        sides = list(sides)
-        return AuthorityView(
-            ladder_version=self.version,
-            ordered_classes=self.ordered(),
-            entitling_class=self.entitling_class(sides),
-            note=(
-                "Presented for a person to settle. The engine does not choose "
-                "between disagreeing claims, and recency is not an input."
-            ),
-        )
+__all__ = [
+    "AnswerLog",
+    "EdgeMemory",
+    "Ladder",
+    "default_ladder",
+]
+"""``Ladder`` and ``default_ladder`` are re-exported from here for callers that
+have always reached the authority ordering through the question interface. They
+are defined in :mod:`edgemem.domain` because a vertical must be able to name a
+ladder without importing this module."""
 
 
 @dataclass
@@ -136,15 +93,25 @@ class EdgeMemory:
         ladder: Ladder | None = None,
         byte_budget: int = 8 * 1024 * 1024,
         quorum: int = 1,
+        pack: SchemaPack | None = None,
+        outbox: Outbox | None = None,
     ) -> None:
         self.store = store
+        self.device_id = store.device_id
+        self.pack = pack or DEFAULT_PACK
         self.policy = policy or DEFAULT_POLICY
-        self.ladder = ladder or Ladder()
+        # An explicitly supplied ladder outranks the pack's, so an operator can
+        # tighten the ordering for one device without writing a new vertical.
+        self.ladder = ladder or self.pack.ladder
         self.byte_budget = byte_budget
         self.quorum = quorum
+        self.outbox = outbox
         self.log = AnswerLog()
         self._context_note: dict[str, ResidencyReason] = {}
         self._depot_known: set[str] = set()
+        self._write_gate = threading.RLock()
+        self._writes = 0
+        self.recovered = self._recover()
 
     # -- recording ---------------------------------------------------------
 
@@ -155,9 +122,20 @@ class EdgeMemory:
         lands, and a decision depends on the device's circumstances — whether
         the depot already holds it, how much allowance is left — which change
         afterwards. A cached reason could contradict the state it describes.
+
+        The write-ahead entry is fsynced before the claim reaches the store,
+        because that ordering is what the durability rests on: a claim that is in
+        the queue survives a kill, and a claim sitting only in a buffered shard
+        does not. What the queue holds is a transport intention rather than a
+        residency verdict, so a claim the policy would never send waits in the
+        queue for a sync to classify it and decline.
         """
-        self.store.upsert([claim])
+        with self.hold_writes():
+            if self.outbox is not None:
+                self.outbox.enqueue(claim)
+            self.store.upsert([claim])
         self._context_note.pop(claim.claim_id, None)
+        self._writes += 1
         return claim
 
     def record_many(self, claims: Iterable[Claim]) -> list[Claim]:
@@ -165,6 +143,83 @@ class EdgeMemory:
         for c in claims:
             self.record(c)
         return claims
+
+    def absorb(self, claims: Iterable[Claim]) -> list[Claim]:
+        """Take claims as they arrive from the depot.
+
+        Stored exactly as they were asserted: claim id, author, observer, the
+        moment the observation was perceived, and the causal context all travel
+        unchanged. A claim re-stamped as this device's own observation would be a
+        different claim. The conflict register decides what is concurrent from
+        that context, so an incoming assertion dressed as a local one would be
+        indistinguishable from something this device actually saw, which is
+        precisely the confusion the register exists to prevent.
+
+        Not queued for onward transmission. These claims came from the depot, and
+        the depot already holds them.
+
+        A claim the depot holds is not marked cloud-only either. This device holds
+        a readable copy and has no cloud read path to fall back on, so marking it
+        would convert a working answer into a refusal. :meth:`mark_present_at_depot`
+        stays the caller's explicit decision about whether the local copy is still
+        the one to answer from.
+        """
+        claims = list(claims)
+        if not claims:
+            return []
+        with self.hold_writes():
+            self.store.upsert(claims)
+        for claim in claims:
+            self._context_note.pop(claim.claim_id, None)
+        return claims
+
+    def _recover(self) -> list[Claim]:
+        """Put back what the write-ahead log knows about and memory does not.
+
+        The outbox is fsynced before :meth:`record` returns, so a kill between the
+        queue entry and the shard's own flush leaves a claim that is on disk and
+        not yet in memory. Replaying the queue when the device is opened closes
+        that window instead of leaving it to a caller to remember.
+        """
+        if self.outbox is None:
+            return []
+        outstanding = [
+            claim
+            for claim in self.outbox.pending()
+            if self.store.get(claim.claim_id) is None
+        ]
+        if outstanding:
+            self.store.upsert(outstanding)
+        return outstanding
+
+    def hold_writes(self) -> threading.RLock:
+        """The write gate, held for as long as the caller needs it.
+
+        Taken around every write and held across the application of an incoming
+        page. A local record therefore either lands before the page or waits for
+        it; it cannot interleave with it and be lost. Reads do not take the gate,
+        so a sync never stalls the question interface.
+        """
+        return self._write_gate
+
+    def local_writes(self) -> int:
+        """Claims written on this device since it was opened.
+
+        A count rather than a queue reading, so a sync can report how much local
+        work happened underneath it without either end inspecting the other's
+        storage.
+        """
+        return self._writes
+
+    def flush(self) -> None:
+        """Make the shard's buffered writes durable now.
+
+        The outbox already covers this device's own claims before :meth:`record`
+        returns. A side that others treat as authoritative about what it holds
+        has no such cover -- the depot, before it numbers a claim in a sequence
+        other devices will be waiting on -- and so calls this itself.
+        """
+        self.store.flush()
 
     def mark_present_at_depot(self, claim_ids: Iterable[str]) -> None:
         """Note claims the device's own record shows are already at the depot.
@@ -214,9 +269,11 @@ class EdgeMemory:
                 subject="",
                 question=question,
                 summary=(
-                    "No claim on this device concerns that subject, so the "
-                    "device cannot answer from its own memory."
+                    f"No {self.pack.labels.claim} on this device concerns any "
+                    f"{self.pack.subject_model.id_label}, so the device cannot "
+                    "answer from its own memory."
                 ),
+                citation=self.pack.citation,
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
 
@@ -225,8 +282,8 @@ class EdgeMemory:
         paths = tuple(sorted({p for _, _, p in rows}))
 
         # An answer must be about the attribute being asked for. A claim about
-        # the trailer's temperature is not an answer to a question about its
-        # seal, and treating it as one is the confident-wrong-answer failure the
+        # one aspect of a subject is not an answer to a question about another,
+        # and treating it as one is the confident-wrong-answer failure the
         # device exists to avoid.
         attribute = self._attribute_for(question, subject)
         usable = [c for c, _, _ in rows if c.subject == subject]
@@ -266,6 +323,7 @@ class EdgeMemory:
                 latency_ms=latency,
                 paths_used=paths,
                 bytes_withheld=withheld_bytes,
+                citation=self.pack.citation,
             )
             previous = self.log.previous(subject, question)
             if previous is not None and previous != verdict.summary:
@@ -281,6 +339,7 @@ class EdgeMemory:
                     latency_ms=latency,
                     paths_used=paths,
                     bytes_withheld=withheld_bytes,
+                    citation=self.pack.citation,
                 )
             self.log.record(subject, question, verdict.summary)
             return verdict
@@ -290,9 +349,10 @@ class EdgeMemory:
             subject=subject,
             question=question,
             summary=(
-                f"The device holds no usable claim about {subject}."
+                f"The device holds no usable {self.pack.labels.claim} about "
+                f"{subject}."
                 + (
-                    f" It holds {len(withheld)} that it was not permitted to use."
+                    f" It holds {len(withheld)} it was not permitted to use."
                     if withheld
                     else ""
                 )
@@ -312,6 +372,7 @@ class EdgeMemory:
             latency_ms=latency,
             paths_used=paths,
             bytes_withheld=withheld_bytes,
+            citation=self.pack.citation,
         )
 
     # -- verdict construction ---------------------------------------------
@@ -355,8 +416,9 @@ class EdgeMemory:
             subject=subject,
             question=question,
             summary=(
-                f"{len(conflicts)} disagreement(s) about {subject}. Every side "
-                "is retained. The engine is not choosing between them."
+                f"{len(conflicts)} {self.pack.labels.conflict}(s) about "
+                f"{subject}. Every side is retained. The engine is not choosing "
+                "between them."
             ),
             claims=cited,
             conflicts=tuple(
@@ -366,6 +428,7 @@ class EdgeMemory:
             latency_ms=latency,
             paths_used=paths,
             bytes_withheld=withheld_bytes,
+            citation=self.pack.citation,
         )
 
     def _supporters(self, claim: Claim) -> int:
@@ -412,6 +475,12 @@ class EdgeMemory:
         ranked by how well they match the question. Returns None when no
         attribute stands out, in which case the answer is not narrowed — a
         broad question legitimately spans several attributes.
+
+        The bound vertical's default attribute is the one exception: a vertical
+        that says which aspect its operators ask about gets that aspect when
+        the question is too vague to name one, because a bare question in that
+        vertical is nearly always about it. With nothing bound there is no
+        default and the answer stays unnarrowed.
         """
         held = self.store.claims_for(subject)
         if not held:
@@ -426,7 +495,10 @@ class EdgeMemory:
             hits = sum(1 for tok in attr.lower().split() if tok in lowered)
             if hits > best_hits:
                 best_hits, best = hits, attr
-        return best if best_hits else None
+        if best_hits:
+            return best
+        default = self.pack.subject_model.default_attribute
+        return default if default in attributes else None
 
     def _is_answerable(self, claim: Claim) -> bool:
         return not claim.is_quarantined() and (
@@ -470,8 +542,21 @@ class EdgeMemory:
             return f"quarantined: {claim.quarantine_reason}"
         return self.residency_of(claim).render()
 
+    def _attribute_label(self, attribute: str) -> str:
+        """The vertical's name for an attribute, or the pack's generic word.
+
+        A mapping lookup, not a branch: an attribute the vertical has not named
+        is rendered with the pack's own word for the concept rather than with a
+        raw key the caller would have to guess at.
+        """
+        model = self.pack.subject_model
+        return model.attributes.get(attribute, self.pack.labels.attribute)
+
     def _summarise(self, cited: tuple[CitedClaim, ...]) -> str:
-        parts = [f"{c.attribute} is recorded as {c.value!r}" for c in cited[:3]]
+        parts = [
+            f"{self._attribute_label(c.attribute)} is recorded as {c.value!r}"
+            for c in cited[:3]
+        ]
         if len(cited) > 3:
             parts.append(f"(+{len(cited) - 3} more)")
         return "; ".join(parts)

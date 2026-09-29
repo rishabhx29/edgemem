@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Iterable
 
 # --------------------------------------------------------------------------
 # time
@@ -85,6 +85,84 @@ class AuthorityClass(str, Enum):
 class Trust(str, Enum):
     TRUSTED = "TRUSTED"
     QUARANTINED = "QUARANTINED"
+
+
+# --------------------------------------------------------------------------
+# authority
+# --------------------------------------------------------------------------
+
+
+DEFAULT_LADDER_NOTE = (
+    "Presented for a person to settle. The engine does not choose between "
+    "disagreeing claims, and recency is not an input."
+)
+
+
+def default_ladder() -> tuple[tuple[AuthorityClass, int], ...]:
+    """Source classes in descending order of entitlement to be believed.
+
+    Data, not code. A vertical replaces the whole ordering through its schema
+    pack; the engine does not change. Recency is not a member of this ordering
+    and is not consulted.
+    """
+    return (
+        (AuthorityClass.INSTRUMENT, 100),
+        (AuthorityClass.ATTESTED_HUMAN, 80),
+        (AuthorityClass.UNATTESTED_HUMAN, 50),
+        (AuthorityClass.THIRD_PARTY_FEED, 30),
+        (AuthorityClass.RUMOUR, 10),
+    )
+
+
+@dataclass
+class Ladder:
+    """A versioned ordering of who could settle a conflict.
+
+    Lives here rather than beside the question interface because a vertical has
+    to be able to name a ladder before it can bind to the engine at all, and a
+    pack that could only be written from inside the seam would make every new
+    vertical an engine change.
+
+    The optional ``note`` is presentation a vertical supplies in place of the
+    engine's own framing of what the ladder is for. It changes nothing about
+    how the ladder ranks; it changes only the words shown to whoever settles
+    the disagreement.
+    """
+
+    version: str = "v1"
+    entries: tuple[tuple[AuthorityClass, int], ...] = default_ladder()
+    note: str | None = None
+
+    def rank(self, source_class: AuthorityClass) -> int:
+        for cls, weight in self.entries:
+            if cls is source_class:
+                return weight
+        return 0
+
+    def ordered(self) -> tuple[str, ...]:
+        return tuple(cls.value for cls, _ in self.entries)
+
+    def entitling_class(self, sides: Iterable[Claim]) -> str | None:
+        """The highest-ranked source class present among the sides.
+
+        Reported, never applied. The engine escalates; a person decides.
+        """
+        best: str | None = None
+        best_rank = -1
+        for claim in sides:
+            rank = self.rank(claim.source_class)
+            if rank > best_rank:
+                best_rank, best = rank, claim.source_class.value
+        return best
+
+    def view(self, sides: Iterable[Claim]) -> AuthorityView:
+        sides = list(sides)
+        return AuthorityView(
+            ladder_version=self.version,
+            ordered_classes=self.ordered(),
+            entitling_class=self.entitling_class(sides),
+            note=self.note or DEFAULT_LADDER_NOTE,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -419,6 +497,13 @@ class Verdict:
     latency_ms: float = 0.0
     paths_used: tuple[str, ...] = ()
     bytes_withheld: int = 0
+    citation: str = ""
+    """The provision this record is being kept under.
+
+    Supplied by the bound vertical. The engine has no opinion about which
+    regulation governs somebody's work, so an unbound device says so rather than
+    borrowing another vertical's.
+    """
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -445,4 +530,5 @@ class Verdict:
             "latency_ms": round(self.latency_ms, 4),
             "paths_used": list(self.paths_used),
             "bytes_withheld": self.bytes_withheld,
+            "citation": self.citation,
         }

@@ -15,12 +15,30 @@ from edgemem.domain import (
     CitedClaim,
     Claim,
     ConflictSide,
+    Ladder,
     NeededClaim,
     Residency,
     ResidencyReason,
     Trust,
     Verdict,
     VerdictKind,
+    default_ladder,
+)
+from edgemem.outbox import Outbox
+from edgemem.schema import (
+    DEFAULT_PACK,
+    UNBOUND_CITATION,
+    Labels,
+    SchemaPack,
+    SubjectModel,
+)
+from edgemem.sync import (
+    Depot,
+    DeviceLink,
+    ProtocolError,
+    SyncPath,
+    SyncReport,
+    VendorSnapshotUnavailable,
 )
 
 __all__ = [
@@ -30,10 +48,24 @@ __all__ = [
     "CitedClaim",
     "Claim",
     "ConflictSide",
+    "DEFAULT_PACK",
+    "Depot",
+    "DeviceLink",
+    "Ladder",
+    "Labels",
     "NeededClaim",
+    "Outbox",
+    "ProtocolError",
     "Residency",
     "ResidencyReason",
+    "SchemaPack",
+    "SubjectModel",
+    "SyncPath",
+    "SyncReport",
     "Trust",
+    "UNBOUND_CITATION",
+    "VendorSnapshotUnavailable",
     "Verdict",
     "VerdictKind",
+    "default_ladder",
 ]
