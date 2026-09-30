@@ -10,6 +10,10 @@ build/
 # Local scratch / probe output
 var/
 
+# Front end
+node_modules/
+.vite/
+
 # Agent tooling that is installed, not source. These are not part of the project.
 .agents/
 

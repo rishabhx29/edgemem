@@ -197,6 +197,8 @@ Asking a question about a subject yields exactly one of four outcomes: answered 
 
 The inspector renders the verdict and nothing else. It holds no information the seam does not produce. This keeps one seam honest and means the demo is a rendering of the test suite's actual output rather than a separate artefact.
 
+**Amendment, 2026-09-30.** The question interface remains strict and single: every answer panel on every page is filled from one `ask` response, and there is no second path by which a question is answered. The demonstration additionally shows a transport rail, reporting the sync path, the claim counts, the cursor and the bytes moved. That is an event rather than an answer, it is confined to the step where an exchange happens, and it is labelled as transport wherever it appears. Rationale and the option rejected are in `docs/adr/0001-demo-transport-rail.md`.
+
 ### Domain abstraction
 
 The engine's only concepts are claim, subject, attribute, conflict, verdict, residency and source class. A vertical supplies a schema pack: display labels, the authority ladder, the subject model, and the regulatory citation. No engine code changes when the vertical changes.

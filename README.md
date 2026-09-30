@@ -56,6 +56,18 @@ side-by-side contrast with a single-writer last-write-wins strategy:
 .\.venv\Scripts\python.exe scripts\demo_comparison.py
 ```
 
+The browser interface, which renders the same scenario step by step. Build the front end
+once, then the Python process serves it:
+
+```powershell
+cd web; npm install; npm run build; cd ..
+.\.venv\Scripts\python.exe scripts\demo_ui.py
+```
+
+Then open http://127.0.0.1:8770. Every verdict, byte count and latency on those pages was
+produced by the engine during the request that rendered it; a test fails the build if any
+of the scenario's own wording appears in the bundle.
+
 The full suite (~5 minutes; every shard is closed and destroyed on teardown):
 
 ```powershell
@@ -129,8 +141,16 @@ src/edgemem/
   schema.py     the pack abstraction: labels, ladder, subject model, citation
   comparison.py the labelled last-write-wins contrast, evidence only
 fixtures/       verticals, deliberately outside the engine package
-scripts/        the demonstrations and the substrate probes
+scripts/
+  story.py      the scenario: claims, fleet, and the order of the steps
+  demo_scenario.py  the narration and the checks over that scenario
+  demo_ui.py    the interface: a JSON API over the same scenario, plus static files
+  demo_comparison.py  the labelled last-write-wins contrast
+  probe_*.py    the substrate probes behind docs/gates.md
+web/            the front end (Vite, React, TypeScript, Tailwind v4)
+  src/lib/types.ts  the wire contract, transcribed from to_payload()
 docs/gates.md   every measured finding, including the ones that corrected us
+docs/adr/       decisions and the option each one rejected
 ```
 
 The engine contains no vocabulary belonging to any industry, and a test reads the forbidden
@@ -139,6 +159,12 @@ words from the packs themselves, so the net cannot quietly narrow. Binding a ver
 
 `fixtures/` lives outside `src/edgemem/` on purpose: a vertical inside the engine package
 would be a vertical the engine imports.
+
+`scripts/story.py` holds the scenario so the command-line demonstration and the browser
+interface cannot tell each other a different story. `demo_scenario.py` narrates it;
+`demo_ui.py` serves it. `web/src/lib/types.ts` is transcribed field-for-field from each
+`to_payload()`, so renaming a key in the engine breaks the front-end build rather than
+rendering `undefined` in front of somebody judging the project.
 
 ## Licence
 

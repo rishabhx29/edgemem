@@ -1,0 +1,199 @@
+@import "tailwindcss";
+
+@import "@fontsource-variable/geist/index.css";
+@import "@fontsource-variable/geist-mono/index.css";
+
+/* ---------------------------------------------------------------------------
+   Evidence file.
+
+   The register is a record that gets read and checked, not a cockpit that gets
+   operated. Off-white at zero chroma, hairline rules instead of boxes, mono
+   marginalia for anything measured. One accent, reserved: a disagreement is the
+   only thing in this product worth colouring.
+--------------------------------------------------------------------------- */
+
+@theme {
+  /* Surfaces. Zero chroma throughout: this is paper, not a tinted theme. */
+  --color-paper: oklch(0.982 0 0);
+  --color-paper-raised: oklch(0.963 0 0);
+  --color-paper-sunk: oklch(0.938 0 0);
+  --color-paper-inverse: oklch(0.22 0.004 250);
+
+  /* Rules. Structure comes from these, not from card borders. */
+  --color-rule: oklch(0.87 0 0);
+  --color-rule-strong: oklch(0.76 0 0);
+
+  /* Ink. Four steps, all above 4.5:1 on --color-paper. */
+  --color-ink: oklch(0.24 0.004 250);
+  --color-ink-muted: oklch(0.46 0.005 250);
+  --color-ink-faint: oklch(0.53 0.005 250);
+  --color-ink-inverse: oklch(0.98 0 0);
+
+  /* The single accent. Used for escalation and nowhere else. */
+  --color-signal: oklch(0.53 0.17 27);
+  --color-signal-deep: oklch(0.42 0.15 27);
+  --color-signal-wash: oklch(0.955 0.018 27);
+  --color-signal-edge: oklch(0.85 0.06 27);
+
+  /* Verdict weights. Three of the four verdicts are neutral: the interface
+     stays still and the disagreement is what moves. */
+  --color-verdict-answered: oklch(0.36 0.01 160);
+  --color-verdict-unresolved: oklch(0.44 0.02 250);
+
+  --font-sans: "Geist Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, Menlo, Consolas, monospace;
+
+  /* Radius lock, concentric: outer surface 2px, anything nested inside it 0,
+     because outer = inner + padding and the padding already exceeds 2px.
+     Tags are the one documented exception and are pills. */
+  --radius-sm: 2px;
+  --radius-nest: 0px;
+  --radius-tag: 999px;
+
+  /* Motion. Custom curves only; the built-in easings lack the intent. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+
+  /* Z scale. Systemic layers only, never arbitrary. */
+  --z-sticky: 10;
+  --z-dropdown: 20;
+  --z-overlay: 30;
+  --z-modal: 40;
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.6;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Display type. -0.03em is the floor for a tight grotesque; tighter and the
+     letters touch. */
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+    font-weight: 560;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  /* One visible focus treatment, everywhere, on the page's own accent. */
+  :focus-visible {
+    outline: 2px solid var(--color-signal);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  ::selection {
+    background: var(--color-signal-wash);
+    color: var(--color-signal-deep);
+  }
+
+  /* Marginalia: the measured, attributed, small-print register of the page.
+     Not an accent, not decoration. */
+  .marginal {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    line-height: 1.5;
+    letter-spacing: 0.01em;
+    color: var(--color-ink-faint);
+  }
+
+  /* Every figure that changes as the question is re-asked, so a latency
+     reading from 3.9 to 12.0 does not shove the layout sideways. */
+  .figure {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  .measure {
+    max-width: 68ch;
+  }
+
+  /* Motion is for state change and hierarchy. Reduced motion keeps the
+     comprehension, drops the movement. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  /* Rule-separated grouping. Preferred over a card: elevation here would imply
+     hierarchy the content does not have. */
+  .band {
+    border-top: 1px solid var(--color-rule);
+    padding-top: 1.25rem;
+  }
+
+  .band-first {
+    border-top: 0;
+    padding-top: 0;
+  }
+
+  /* Everything pressable: a press has to be felt. 0.96 is the floor that
+     still reads as feedback rather than exaggeration. */
+  .press {
+    transition:
+      transform 140ms var(--ease-out),
+      background-color 140ms var(--ease-out),
+      color 140ms var(--ease-out),
+      border-color 140ms var(--ease-out);
+  }
+
+  .press:active {
+    transform: scale(0.96);
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .press:hover {
+      transform: translateY(-1px);
+    }
+    .press:active {
+      transform: scale(0.96);
+    }
+  }
+
+  .press-quiet {
+    transition:
+      background-color 140ms var(--ease-out),
+      color 140ms var(--ease-out),
+      border-color 140ms var(--ease-out);
+  }
+
+  .press-quiet:active {
+    transform: scale(0.96);
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .press-quiet:hover {
+      background-color: var(--color-paper-sunk);
+    }
+  }
+}
