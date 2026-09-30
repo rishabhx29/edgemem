@@ -713,6 +713,12 @@ class DeviceLink:
                     if entry.get("claim_id") in set(reply.get("accepted") or [])
                     | set(reply.get("duplicates") or [])
                 }
+                if settled:
+                    # Acking drops the claim's write-ahead-log entry, which is
+                    # what would otherwise replay it after a crash. A shard write
+                    # is not durable until flushed, so the local copy has to be on
+                    # disk before the entry that guarantees it is removed.
+                    self.memory.flush()
                 self.outbox.ack(settled)
                 self.cursor.learn(
                     int(entry["seq"])
@@ -725,6 +731,13 @@ class DeviceLink:
             if page:
                 reapplied += self._absorb(page, notes)
                 pulled += len(page)
+                # The cursor is written durably by learn(). A shard write does
+                # not survive a hard kill until it is flushed, so the absorbed
+                # claims must be on disk BEFORE the position that says they were
+                # absorbed. The reverse order loses a claim permanently: the
+                # cursor promises the depot it needs not resend it, and the shard
+                # no longer has it.
+                self.memory.flush()
             self.cursor.learn(int(wire["seq"]) for wire in reply.get("delta") or [])
             if on_page is not None:
                 on_page(len(page))

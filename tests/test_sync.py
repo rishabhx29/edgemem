@@ -8,9 +8,11 @@ The observations are ``SyncReport`` fields and what ``ask`` returns afterwards.
 The report is an accounting surface rather than a second seam: it says what moved,
 and every claim it mentions is then checked by asking a question about it.
 
-The active sync path is asserted rather than assumed. No Qdrant server can run on
-this machine, so the vendor's shard-manifest path cannot run either, and every
-report in this file says ``depot_delta`` because that is what executed.
+The active sync path is asserted rather than assumed. A Qdrant server now runs in
+WSL2 and is reachable, so the vendor's shard-manifest path was tested rather than
+presumed unavailable: it cannot run because ``snapshot_manifest()`` fails on a
+restored shard in this release (see ``docs/gates.md``, Gate 5). Every report in
+this file says ``depot_delta`` because that is what executed.
 """
 
 from __future__ import annotations
@@ -542,7 +544,12 @@ def test_both_ends_report_the_path_that_actually_ran(
 def test_the_vendor_path_is_refused_rather_than_pretended(
     tmp_path, device_factory
 ):
-    """No Qdrant server can run here, so the vendor path cannot run either.
+    """The vendor path is refused when it cannot actually run.
+
+    It is refused because it is measured as unusable, not because a server was
+    missing: ``snapshot_manifest()`` fails on a shard restored from a snapshot
+    in this release, and the sparse vectors do not survive the snapshot. See
+    ``docs/gates.md``, Gate 5.
 
     Reporting ``depot_delta`` because that is what ran is the requirement. Running
     something else under the vendor's name would be the failure this repository

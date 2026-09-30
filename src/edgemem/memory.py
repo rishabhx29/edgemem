@@ -71,15 +71,34 @@ class AnswerLog:
     """
 
     entries: dict[tuple[str, str], str] = field(default_factory=dict)
+    _cited: dict[tuple[str, str], frozenset[str]] = field(default_factory=dict)
 
     def previous(self, subject: str, question: str) -> str | None:
         return self.entries.get((subject, question.strip().lower()))
 
-    def record(self, subject: str, question: str, summary: str) -> None:
-        self.entries[(subject, question.strip().lower())] = summary
+    def previous_cited(self, subject: str, question: str) -> frozenset[str]:
+        """The claim ids behind the previous answer, or empty if there was none."""
+        return self._cited.get((subject, question.strip().lower()), frozenset())
 
-    def changed_by(self, subject: str, question: str) -> str | None:
-        """The claim that most plausibly accounts for a changed answer."""
+    def record(self, subject: str, question: str, summary: str, cited: Iterable[Claim]) -> None:
+        key = (subject, question.strip().lower())
+        self.entries[key] = summary
+        self._cited[key] = frozenset(c.claim_id for c in cited)
+
+    def changed_by(
+        self, subject: str, question: str, current: Iterable[Claim]
+    ) -> str | None:
+        """The claim that changed the answer, or None if none accounts for it.
+
+        The claim ids behind the previous answer are compared with the ones
+        behind this one. Exactly one newcomer is a cause; zero or several is not
+        something this log can attribute, and it says so rather than guessing.
+        """
+        newcomers = {c.claim_id for c in current} - self.previous_cited(
+            subject, question
+        )
+        if len(newcomers) == 1:
+            return next(iter(newcomers))
         return None
 
 
@@ -327,6 +346,9 @@ class EdgeMemory:
             )
             previous = self.log.previous(subject, question)
             if previous is not None and previous != verdict.summary:
+                # Compute the cause against the previous answer's claims before
+                # recording this one, which is what overwrites them.
+                cause = self.log.changed_by(subject, question, usable)
                 verdict = Verdict(
                     kind=VerdictKind.CORRECTED,
                     subject=subject,
@@ -335,13 +357,13 @@ class EdgeMemory:
                     claims=cited,
                     needed=verdict.needed,
                     previous_summary=previous,
-                    changed_by=cited[0].claim_id,
+                    changed_by=cause,
                     latency_ms=latency,
                     paths_used=paths,
                     bytes_withheld=withheld_bytes,
                     citation=self.pack.citation,
                 )
-            self.log.record(subject, question, verdict.summary)
+            self.log.record(subject, question, verdict.summary, usable)
             return verdict
 
         return Verdict(
