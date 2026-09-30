@@ -138,14 +138,54 @@ Two consequences, both architectural rather than cosmetic:
 
 ## Fallback recorded (environmental, not a gate failure)
 
-No container runtime is available on this machine, so a Qdrant **server** cannot be
-run locally. The vendor's server→edge partial-snapshot path (`snapshot_manifest` →
-`/snapshot/partial/create` → `update_from_snapshot`) cannot be exercised here.
+A Qdrant server is now reachable — see Gate 5 — so this fallback is no longer
+forced by the environment. It is chosen on evidence.
 
-**Decision:** the engine implements its own incremental delta exchange against the
-depot endpoint and reports which sync path is active. Upgrading to the vendor
-snapshot path is a configuration change, not a rewrite. Surfaced in the product
-rather than hidden.
+## Gate 5 — is the vendor's snapshot path usable in 0.8.0?
+
+**NO, for the hybrid path. Full snapshots restore dense vectors; sparse vectors
+do not survive, and a restored shard cannot produce a manifest.**
+
+A Qdrant 1.19.1 server runs in WSL2 and is reachable from Windows on port 6333.
+Reproduce with `.\.venv\Scripts\python.exe scripts\probe_vendor_path.py`; raw
+output in `var/gates/vendor_path.json`.
+
+| Step | Result |
+| --- | --- |
+| Server reachable | yes — qdrant 1.19.1 |
+| Create + seed an Edge Shard | yes, 4 points |
+| Create a matching server collection | yes, 4 points |
+| Server-side full snapshot | 225,792 bytes |
+| `unpack_snapshot` into an Edge Shard | 4 points restored |
+| **Dense query against the restored shard** | **3 hits — works** |
+| **BM25 sparse query against the restored shard** | **0 hits, before and after `optimize()`** |
+| `snapshot_manifest()` on a restored shard | raises `Shard is not initialized` |
+| Partial snapshot via manifest | unreachable — the manifest step fails |
+| Reload a live shard directory | ok |
+
+The restored shard reports `payload_schema={}` and `indexed_vectors_count=0`, which
+is consistent with the sparse vectors not being carried across the snapshot
+boundary. A direct follow-up probe confirmed the split: dense nearest-neighbour
+returns hits from a restored shard while the sparse leg returns none, and
+`optimize()` does not repair it.
+
+**Consequence.** The vendor's server→edge mechanism is built around
+`snapshot_manifest()` → `/snapshot/partial/create` → `update_from_snapshot()`, and
+the first of those steps fails on a restored shard in this release. Partial
+snapshots are therefore **not available** to this project, and the incremental
+exchange against the depot endpoint is the working path — not a shortcut taken
+because a container runtime was missing.
+
+**What the vendor path would have given up, and did not.** Full-snapshot restore
+of a dense shard works, so a device *can* be seeded from the server. The engine
+uses its own delta exchange for increments and the server for central aggregation
+and cross-device visibility.
+
+**Honest framing for the demonstration.** The engine reports which path ran on
+every sync, and the report names the reason: the vendor's partial-snapshot
+mechanism depends on a manifest this release cannot produce for a restored shard.
+That is a finding about the library, measured and reproducible, not a claim about
+this engine.
 
 ## Reporting the fallback rather than claiming the vendor path
 
