@@ -96,15 +96,21 @@ class AnswerLog:
     def previous(self, subject: str, question: str) -> str | None:
         return self.entries.get((subject, question.strip().lower()))
 
-    def mark_unanswered(self, subject: str, question: str) -> None:
-        """Record that the device could not answer this at all.
+    def mark_unanswered(self, subject: str, question: str, summary: str) -> None:
+        """Record that the device could not answer this at all, and what it said.
 
         So that learning enough to answer later is reportable as a correction,
         rather than as a first answer that happens to be confident.
+
+        The summary is kept, not just the fact. An unanswered question is the one
+        case where the device still had something to say, and storing an empty
+        string in its place meant the CORRECTED verdict that followed could report
+        that it had changed without being able to show what it had changed from —
+        the interface promised both answers and had only one to hand.
         """
         key = (subject, question.strip().lower())
         self._unanswered.add(key)
-        self.entries.setdefault(key, "")
+        self.entries.setdefault(key, summary)
 
     def was_unresolved(self, subject: str, question: str) -> bool:
         return (subject, question.strip().lower()) in self._unanswered
@@ -513,7 +519,27 @@ class EdgeMemory:
             self.log.clear_unanswered(subject, question)
             return verdict
 
-        self.log.mark_unanswered(subject, question)
+        unresolved = self._unresolved(
+            subject, question, withheld, latency, paths, withheld_bytes
+        )
+        self.log.mark_unanswered(subject, question, unresolved.summary)
+        return unresolved
+
+    def _unresolved(
+        self,
+        subject: str,
+        question: str,
+        withheld: list[Claim],
+        latency: float,
+        paths: tuple[str, ...],
+        withheld_bytes: int,
+    ) -> Verdict:
+        """What the device says when it holds nothing it is permitted to use.
+
+        The claim is that it cannot answer, which is a claim about what is missing
+        rather than about the world, so everything it can still say is said here:
+        the count it is withholding and the byte cost of being allowed to.
+        """
         return Verdict(
             kind=VerdictKind.UNRESOLVED_CLOUD_REQUIRED,
             subject=subject,
