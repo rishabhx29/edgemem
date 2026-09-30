@@ -511,6 +511,11 @@ class Depot:
             entry["seq"] = seq
             delta.append(entry)
 
+        # Claims this device has not seen, in total. If any were numbered after
+        # the page it was served, they arrived while it was syncing and will
+        # come down next time, and it should be told rather than left to
+        # discover that its view of the fleet is behind.
+        outstanding = self.ledger.since(cursor, known, page_size + 10_000)
         return {
             "depot_id": self.depot_id,
             "path": self.path.value,
@@ -519,6 +524,7 @@ class Depot:
             "numbered": numbered,
             "delta": delta,
             "delta_bytes": sum(_serialised(entry) for entry in delta),
+            "arrived_during_sync": max(0, len(outstanding) - len(delta)),
             "has_more": len(self.ledger.since(cursor, known, page_size + 1))
             > len(wanted),
         }
@@ -605,16 +611,24 @@ class PullCursor:
     path: Path
     cursor: int = 0
     known: set[int] = field(default_factory=set)
+    rewound: bool = False
+    """True when the stored position was unreadable and this cursor started from
+    the beginning. Safe, since claims carry their own identity and the depot
+    recognises one it already holds, but worth saying out loud."""
 
     @classmethod
     def load(cls, path: Path) -> "PullCursor":
-        stored = durable_read_json(path, {"cursor": 0, "known": []})
+        stored, rewound = durable_read_json(path, {"cursor": 0, "known": []})
         raw_known = stored.get("known")
-        return cls(
+        cursor = cls(
             path=Path(path),
             cursor=int(stored.get("cursor", 0) or 0),
             known={int(s) for s in raw_known} if isinstance(raw_known, list) else set(),
         )
+        # Safe to rewind, but not something to do quietly: the next sync
+        # re-reads from the start, which is correct and slow.
+        cursor.rewound = rewound
+        return cursor
 
     def learn(self, seqs: Iterable[int]) -> int:
         """Record sequences the device now holds, and close any gap they fill."""
@@ -754,6 +768,24 @@ class DeviceLink:
             notes.append(
                 f"{owed} claim(s) are held on the device and are not yet at the depot"
             )
+        # A sync that pushed this device's own claims up may have been numbered
+        # after the pull was planned, so those claims are at the depot but not
+        # yet here. Convergence for a fleet of N takes N rounds, not one, and
+        # reporting that is the difference between eventual consistency and a
+        # guarantee this device cannot make on its own behalf.
+        if self.cursor.rewound:
+            notes.append(
+                "the stored pull position was unreadable, so this sync re-read "
+                "from the beginning; nothing is duplicated or lost, but the "
+                "transfer is larger than it needs to be"
+            )
+        arrived_during = int(reply.get("arrived_during_sync", 0) or 0)
+        if arrived_during:
+            notes.append(
+                f"{arrived_during} claim(s) reached the depot during this sync and "
+                f"will be pulled on the next one; this device's view is current, "
+                f"the fleet's is not"
+            )
         if complete:
             durable_write_json(
                 self._last_sync_path,
@@ -853,7 +885,7 @@ class DeviceLink:
         return reapplied
 
     def _offline_seconds(self, now: Any) -> float:
-        stored = durable_read_json(self._last_sync_path, {})
+        stored, _ = durable_read_json(self._last_sync_path, {})
         try:
             return max(0.0, (now - parse_iso(str(stored["at"]))).total_seconds())
         except (KeyError, TypeError, ValueError):

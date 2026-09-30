@@ -72,23 +72,33 @@ def durable_write_json(path: Path, payload: dict[str, Any]) -> None:
     fsync_dir(path.parent)
 
 
-def durable_read_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+def durable_read_json(
+    path: Path, default: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
     """Read a document written by :func:`durable_write_json`.
 
     An unreadable document falls back to the default, which for a pull position
     means the beginning. Re-reading from the beginning duplicates nothing and
-    loses nothing; guessing at a position the device cannot substantiate could do
-    both.
+    loses nothing, since claims carry their own identity and the depot
+    recognises one it already holds; guessing at a position the device cannot
+    substantiate could do both.
+
+    The second element says whether that happened. Rewinding is safe, so it is
+    not an error, but a device that silently starts a long transfer from the
+    beginning again has lost an operator's afternoon, and needs to be able to
+    say so.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
     except (FileNotFoundError, NotADirectoryError):
-        return dict(default)
+        return dict(default), False
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError:
-        return dict(default)
-    return loaded if isinstance(loaded, dict) else dict(default)
+        return dict(default), True
+    if isinstance(loaded, dict):
+        return loaded, False
+    return dict(default), True
 
 
 def fsync_dir(path: Path) -> None:
