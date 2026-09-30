@@ -16,6 +16,12 @@ Four verdicts, and the engine chooses between them:
   and what that would cost.
 - **CORRECTED** â€” the same question now answers differently because the device
   learned something. Both answers are returned.
+
+Two further things every verdict says about the claims it leans on, both because
+a bare count is not the same as agreement: where each claim came from, and how
+much of the apparent backing for it comes from a source other than its own. A
+rumour written down four times is one voice that got louder, and a verdict that
+reported only "three supporting claims" would have called it a chorus.
 """
 
 from __future__ import annotations
@@ -26,10 +32,12 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from edgemem.domain import (
+    AuthorityClass,
     CausalContext,
     CitedClaim,
     Claim,
     ConflictSide,
+    Corroboration,
     Ladder,
     NeededClaim,
     Residency,
@@ -49,11 +57,13 @@ from edgemem.residency import (
 )
 from edgemem.schema import DEFAULT_PACK, SchemaPack
 from edgemem.store import ShardStore
+from edgemem.trust import DEFAULT_TRUST_POLICY, TrustPolicy
 
 __all__ = [
     "AnswerLog",
     "EdgeMemory",
     "Ladder",
+    "TrustPolicy",
     "default_ladder",
 ]
 """``Ladder`` and ``default_ladder`` are re-exported from here for callers that
@@ -114,6 +124,7 @@ class EdgeMemory:
         quorum: int = 1,
         pack: SchemaPack | None = None,
         outbox: Outbox | None = None,
+        trust: TrustPolicy | None = None,
     ) -> None:
         self.store = store
         self.device_id = store.device_id
@@ -122,6 +133,10 @@ class EdgeMemory:
         # An explicitly supplied ladder outranks the pack's, so an operator can
         # tighten the ordering for one device without writing a new vertical.
         self.ladder = ladder or self.pack.ladder
+        # Likewise the trust gate: the pack names who outranks whom, and never
+        # which sources this device refuses. An operator who distrusts a class
+        # says so here, and the device's memory is arranged accordingly.
+        self.trust = trust or DEFAULT_TRUST_POLICY
         self.byte_budget = byte_budget
         self.quorum = quorum
         self.outbox = outbox
@@ -148,7 +163,13 @@ class EdgeMemory:
         does not. What the queue holds is a transport intention rather than a
         residency verdict, so a claim the policy would never send waits in the
         queue for a sync to classify it and decline.
+
+        The claim the device keeps is the one the trust gate returned, not the one
+        that was handed over. A claim from a held source is stored apart rather
+        than refused: it is still on the device, still readable, still the
+        operator's to look at — and it cannot answer anything.
         """
+        claim = self._gate(claim)
         with self.hold_writes():
             if self.outbox is not None:
                 self.outbox.enqueue(claim)
@@ -158,21 +179,71 @@ class EdgeMemory:
         return claim
 
     def record_many(self, claims: Iterable[Claim]) -> list[Claim]:
-        claims = list(claims)
-        for c in claims:
-            self.record(c)
-        return claims
+        return [self.record(c) for c in claims]
+
+    def _gate(self, claim: Claim) -> Claim:
+        """The claim as this device will hold it, after the trust gate.
+
+        Judged once, on arrival, and only ever to add a quarantine: a claim that
+        already carries one keeps its author's reason, because the gate has no
+        standing to overrule a judgement that was made on purpose. Nothing here
+        reads a clock or consults anything but the ladder, so the same claim
+        reaching two devices reaches the same verdict — and neither the arrival
+        nor any later moment can undo it.
+        """
+        if claim.is_quarantined():
+            return claim
+        decision = self.trust.decide(claim, self.ladder)
+        if not decision.held:
+            return claim
+        return claim.with_trust(decision.trust, decision.reason)
+
+    def release(self, claim_ids: Iterable[str], reason: str) -> list[Claim]:
+        """Let held claims into the answerable memory, and say who let them.
+
+        An action, not a state. Nothing else in the engine can end a quarantine:
+        the claim is not re-judged as time passes, the shard is not re-judged when
+        it is reopened, and a reconnect replays the decision that was already made
+        rather than making a new one. Somebody has to do this, and ``reason`` is
+        required because a release nobody can account for is indistinguishable
+        from a quarantine that quietly lapsed.
+
+        Returns the claims that were actually released. A claim that was never
+        held is left alone and simply does not appear: the caller asked to be
+        told what it got, and a name the device does not hold raises instead,
+        because that is a caller mistake rather than a judgement.
+        """
+        if not reason or not reason.strip():
+            raise ValueError("a release must say who is releasing the claim and why")
+        released: list[Claim] = []
+        for claim_id in claim_ids:
+            held = self.store.get(claim_id)
+            if held is None:
+                raise KeyError(f"this device holds no claim {claim_id!r} to release")
+            if not held.is_quarantined():
+                continue
+            let_go = held.with_release(reason.strip())
+            with self.hold_writes():
+                self.store.upsert([let_go])
+            self._context_note.pop(let_go.claim_id, None)
+            released.append(let_go)
+        return released
 
     def absorb(self, claims: Iterable[Claim]) -> list[Claim]:
         """Take claims as they arrive from the depot.
 
-        Stored exactly as they were asserted: claim id, author, observer, the
-        moment the observation was perceived, and the causal context all travel
-        unchanged. A claim re-stamped as this device's own observation would be a
-        different claim. The conflict register decides what is concurrent from
-        that context, so an incoming assertion dressed as a local one would be
+        Stored as they were asserted: claim id, author, observer, the moment the
+        observation was perceived, and the causal context all travel unchanged. A
+        claim re-stamped as this device's own observation would be a different
+        claim. The conflict register decides what is concurrent from that
+        context, so an incoming assertion dressed as a local one would be
         indistinguishable from something this device actually saw, which is
         precisely the confusion the register exists to prevent.
+
+        The trust gate does mark arriving claims, and that is not a contradiction
+        of the above: provenance is untouched, and being unable to believe a
+        source is a separate fact from where the assertion came from. A claim the
+        gate holds is kept whole and readable, held apart from what answers.
 
         Not queued for onward transmission. These claims came from the depot, and
         the depot already holds them.
@@ -183,7 +254,7 @@ class EdgeMemory:
         stays the caller's explicit decision about whether the local copy is still
         the one to answer from.
         """
-        claims = list(claims)
+        claims = [self._gate(c) for c in claims]
         if not claims:
             return []
         with self.hold_writes():
@@ -311,8 +382,19 @@ class EdgeMemory:
         usable = [c for c in usable if self._is_answerable(c)]
         withheld = self._withheld_for(subject)
         conflicts = self._conflicts_for(subject)
+        # One read of the corroboration population per asserted value, shared by
+        # every claim that asserts it, so the figure a verdict reports is the
+        # figure the engine measured rather than one recomputed per citation.
+        agreeing: dict[str, list[Claim]] = {}
+        for candidate in usable:
+            agreeing.setdefault(
+                _agreement_key(candidate), self._agreements(candidate)
+            )
         cited = tuple(
-            CitedClaim.of(c, self.residency_of(c)) for c in usable
+            CitedClaim.of(
+                c, self.residency_of(c), self._corroboration(c, agreeing[_agreement_key(c)])
+            )
+            for c in usable
         )
         withheld_bytes = sum(estimate_outbound_bytes(c) for c in withheld)
 
@@ -411,17 +493,28 @@ class EdgeMemory:
     ) -> Verdict:
         sides: list[ConflictSide] = []
         for left, right in conflicts:
-            a = CitedClaim.of(left, self.residency_of(left))
-            b = CitedClaim.of(right, self.residency_of(right))
+            left_agreeing = self._agreements(left)
+            right_agreeing = self._agreements(right)
+            a = CitedClaim.of(
+                left,
+                self.residency_of(left),
+                self._corroboration(left, left_agreeing),
+            )
+            b = CitedClaim.of(
+                right,
+                self.residency_of(right),
+                self._corroboration(right, right_agreeing),
+            )
             a_rank = self.ladder.rank(left.source_class)
             b_rank = self.ladder.rank(right.source_class)
-            a_supporters = self._supporters(left)
-            b_supporters = self._supporters(right)
+            a_supporters = len(left_agreeing)
+            b_supporters = len(right_agreeing)
             sides.append(
                 ConflictSide(
                     claim=a,
                     supporters=a_supporters,
                     entitling=a_rank >= b_rank,
+                    corroboration=a.corroboration,
                 )
             )
             sides.append(
@@ -429,10 +522,22 @@ class EdgeMemory:
                     claim=b,
                     supporters=b_supporters,
                     entitling=b_rank > a_rank,
+                    corroboration=b.corroboration,
                 )
             )
 
         all_claims = [c for pair in conflicts for c in pair]
+        self_corroborated = [
+            side
+            for side in sides
+            if side.corroboration is not None and side.corroboration.self_corroborated
+        ]
+        echo_note = (
+            f" {len(self_corroborated)} of these sides are corroborated only by "
+            "their own source class, which is that source agreeing with itself."
+            if self_corroborated
+            else ""
+        )
         return Verdict(
             kind=VerdictKind.CONFLICTED,
             subject=subject,
@@ -440,7 +545,7 @@ class EdgeMemory:
             summary=(
                 f"{len(conflicts)} {self.pack.labels.conflict}(s) about "
                 f"{subject}. Every side is retained. The engine is not choosing "
-                "between them."
+                f"between them.{echo_note}"
             ),
             claims=cited,
             conflicts=tuple(
@@ -453,14 +558,63 @@ class EdgeMemory:
             citation=self.pack.citation,
         )
 
-    def _supporters(self, claim: Claim) -> int:
-        """How many independent claims on this device agree with this one."""
-        same = [
+    def _agreements(self, claim: Claim) -> list[Claim]:
+        """Everything this device holds that asserts the same thing.
+
+        This is the raw claim count, echoes and all: it answers how much is
+        written down, which is not the same question as :meth:`_corroboration`'s
+        how much of it is somebody else. Both figures reach the caller, rather
+        than one of them quietly standing in for the other.
+
+        Quarantined claims are not in this population. They are still readable
+        and still stored, but a claim the device has declined to believe cannot be
+        turned into evidence for one it has accepted — otherwise the gate could be
+        walked around by writing the same rumour twice.
+
+        Residency is not consulted, and deliberately so. A claim that lives at the
+        depot and a claim that never left are both still assertions this device
+        can read, and both may corroborate. Where a claim may *live* and whether
+        it may be *believed* are separate questions, and only one of them is a
+        judgement about the claim's source.
+        """
+        return [
             c
             for c in self.store.claims_for(claim.subject)
-            if c.attribute == claim.attribute and c.value == claim.value
+            if c.attribute == claim.attribute
+            and c.value == claim.value
+            and not c.is_quarantined()
         ]
-        return len(same)
+
+    def _corroboration(self, claim: Claim, agreeing: list[Claim] | None = None) -> Corroboration:
+        """How many distinct sources back this claim, and who they are.
+
+        A claim corroborated only by its own source class has not been corroborated
+        at all, and saying so is the whole point of counting per class rather than
+        counting claims: a rumour the same rumour keeps repeating is one voice
+        that got louder, and a bare integer would report it as a chorus.
+
+        Classes are reported in ladder order, highest entitled first, so the
+        figure reads in the order a reader would weigh it. Recency plays no part:
+        the newest echo is no more corroboration than the oldest.
+        """
+        agreeing = self._agreements(claim) if agreeing is None else agreeing
+        by_class: dict[str, int] = {}
+        for other in agreeing:
+            key = other.source_class.value
+            by_class[key] = by_class.get(key, 0) + 1
+        ordered = sorted(
+            by_class,
+            key=lambda name: (
+                -self.ladder.rank(AuthorityClass(name)),
+                name,
+            ),
+        )
+        own = claim.source_class.value
+        return Corroboration(
+            classes=tuple((name, by_class[name]) for name in ordered),
+            independent_classes=tuple(name for name in ordered if name != own),
+            echoes=by_class.get(own, 1) - 1,
+        )
 
     def _conflicts_for(self, subject: str) -> list[tuple[Claim, Claim]]:
         """Pairs of claims that cannot both be true, and are concurrent.
@@ -581,6 +735,21 @@ class EdgeMemory:
         ]
         if len(cited) > 3:
             parts.append(f"(+{len(cited) - 3} more)")
+        echoes = [
+            c
+            for c in cited
+            if c.corroboration is not None and c.corroboration.self_corroborated
+        ]
+        for c in echoes:
+            # Said here, in the sentence the caller reads, rather than left to be
+            # recovered by dividing one number by another. A rumour the rumour
+            # keeps repeating is the failure this exists to catch, and a warning
+            # nobody has to look for is not a warning.
+            parts.append(
+                f"no source class other than {c.source_class} agrees with it "
+                f"({c.corroboration.echoes} further "
+                f"{c.source_class} claim(s) repeat it)"
+            )
         return "; ".join(parts)
 
     def _infer_subject(self, question: str) -> str | None:
@@ -612,6 +781,22 @@ class EdgeMemory:
             "claims": len(claims),
             "by_residency": by_residency,
             "quarantined": sum(1 for c in claims if c.is_quarantined()),
+            "released": sum(1 for c in claims if c.was_released()),
             "index": self.index_state(),
             "ladder_version": self.ladder.version,
+            "trust_policy_version": self.trust.policy_version,
+            "trust_held_classes": sorted(
+                c.value for c in self.trust.held_classes
+            ),
+            "trust_entitlement_floor": self.trust.entitlement_floor,
         }
+
+
+def _agreement_key(claim: Claim) -> tuple[str, str, str]:
+    """What two claims must match to be corroborating each other.
+
+    Subject, attribute and value. Not the source class — that is precisely what
+    the corroboration figure is trying to work out — and not the author, because
+    one person restating something is as much an echo as one class restating it.
+    """
+    return (claim.subject, claim.attribute, claim.value)

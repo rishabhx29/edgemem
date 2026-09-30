@@ -281,6 +281,15 @@ class Claim:
 
     quarantine_reason: str | None = None
 
+    release_note: str | None = None
+    """What the operator said when they released this claim from quarantine.
+
+    Kept beside ``quarantine_reason`` rather than overwriting it. Both remain true
+    — the claim was held, and it was let go — and a reader who can only see the
+    released claim still learns that a gate once stood in front of it and what the
+    gate said. This is a judgement about one claim, recorded where the claim is.
+    """
+
     def __post_init__(self) -> None:
         # Claims arrive from a depot over a sync, so they are untrusted input.
         # Coerce the enums rather than trusting the caller to have used them:
@@ -303,8 +312,20 @@ class Claim:
     def with_trust(self, trust: Trust, reason: str | None) -> "Claim":
         return replace(self, trust=trust, quarantine_reason=reason)
 
+    def with_release(self, note: str) -> "Claim":
+        """Let the claim into the answerable memory, and record who said so.
+
+        The quarantine reason is deliberately left in place. Releasing a claim
+        does not retract the judgement that held it; it adds the operator's own,
+        and the two together are what a reader of the record needs.
+        """
+        return replace(self, trust=Trust.TRUSTED, release_note=note)
+
     def is_quarantined(self) -> bool:
         return self.trust == Trust.QUARANTINED
+
+    def was_released(self) -> bool:
+        return self.release_note is not None and not self.is_quarantined()
 
     def to_payload(self) -> dict[str, Any]:
         """Serialise for the vector store. Every field is indexed, not embedded.
@@ -332,6 +353,7 @@ class Claim:
             "salience": float(self.salience),
             "urgency": float(self.urgency),
             "quarantine_reason": self.quarantine_reason,
+            "release_note": self.release_note,
         }
 
     @staticmethod
@@ -364,6 +386,7 @@ class Claim:
             salience=float(payload.get("salience", 0.5)),
             urgency=float(payload.get("urgency", 0.5)),
             quarantine_reason=payload.get("quarantine_reason"),
+            release_note=payload.get("release_note"),
         )
 
     def text_for_matching(self) -> str:
@@ -405,6 +428,79 @@ class ResidencyReason:
 
 
 @dataclass(frozen=True)
+class Corroboration:
+    """How much of a claim's apparent agreement is somebody other than itself.
+
+    A count of claims is not a count of sources. One rumour written down four
+    times is four claims and one source, and a verdict that reports only "3
+    supporting claims" has dressed a single voice up as a chorus. So the figure
+    is broken out by the source class that made each agreeing claim, and three
+    things are said about it:
+
+    - ``classes`` — every agreeing claim, grouped by source class, highest
+      entitled class first. What the raw count always was, still visible.
+    - ``independent_classes`` — the classes *other than this claim's own*. This is
+      the part that is actually corroboration.
+    - ``echoes`` — agreeing claims from this claim's own class. Not support: the
+      same source saying the same thing again is the claim talking to itself.
+
+    A claim with echoes and no independent class is corroborated only by itself,
+    and says so here rather than leaving the reader to divide one number by
+    another to discover it.
+    """
+
+    classes: tuple[tuple[str, int], ...] = ()
+    """Source class -> agreeing claims, including this one in its own class."""
+
+    independent_classes: tuple[str, ...] = ()
+    """Source classes other than this claim's own, highest entitled first."""
+
+    echoes: int = 0
+    """Agreeing claims from this claim's own source class."""
+
+    @property
+    def voices(self) -> int:
+        """Distinct sources behind the claim, counting the claim itself once.
+
+        Three people of the same class agreeing is one voice, not three. Reported
+        next to :attr:`classes` rather than in place of it, so nothing is hidden.
+        """
+        return 1 + len(self.independent_classes)
+
+    @property
+    def self_corroborated(self) -> bool:
+        """True when the claim is echoed by its own class and by nobody else."""
+        return self.echoes > 0 and not self.independent_classes
+
+    @property
+    def agreeing_claims(self) -> int:
+        """Every claim that asserts the same thing, echoes included."""
+        return sum(count for _, count in self.classes)
+
+    def count_for(self, source_class: str) -> int:
+        return dict(self.classes).get(source_class, 0)
+
+    def render(self) -> str:
+        breakdown = ", ".join(f"{name} {count}" for name, count in self.classes)
+        if self.self_corroborated:
+            return (
+                f"{breakdown} — one source class repeating itself, "
+                "corroborated by no other source"
+            )
+        others = len(self.independent_classes)
+        return f"{breakdown} — {others} other source class(es) agree"
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "classes": [list(pair) for pair in self.classes],
+            "independent_classes": list(self.independent_classes),
+            "echoes": self.echoes,
+            "voices": self.voices,
+            "self_corroborated": self.self_corroborated,
+        }
+
+
+@dataclass(frozen=True)
 class CitedClaim:
     """A claim as the caller sees it: content plus attribution."""
 
@@ -421,10 +517,29 @@ class CitedClaim:
     residency: str
     reason: str
     corroborations: int = 1
+    """How many claims, this one included, assert the same thing.
+
+    A claim count, not a source count: echoes are included, because they are real
+    claims. Read :attr:`corroboration` to see how many of them are somebody other
+    than this claim's own source class.
+    """
+
     stale: bool = False
+    corroboration: Corroboration | None = None
+    """Who backs this claim, broken out by source class.
+
+    Optional so a citation built without a population to compare against still
+    renders. Never ``None`` on a claim a verdict used: the engine always knows
+    what else on the device asserts the same thing, and declining to say would
+    leave a reader to assume the number above was the whole story.
+    """
 
     @staticmethod
-    def of(claim: Claim, residency: ResidencyReason) -> "CitedClaim":
+    def of(
+        claim: Claim,
+        residency: ResidencyReason,
+        corroboration: Corroboration | None = None,
+    ) -> "CitedClaim":
         return CitedClaim(
             claim_id=claim.claim_id,
             subject=claim.subject,
@@ -438,7 +553,38 @@ class CitedClaim:
             trust=claim.trust.value,
             residency=residency.residency.value,
             reason=residency.render(),
+            corroborations=(
+                corroboration.agreeing_claims if corroboration else 1
+            ),
+            corroboration=corroboration,
         )
+
+    def to_payload(self) -> dict[str, Any]:
+        """Plain data, so a verdict survives ``json.dumps`` intact.
+
+        Built field by field rather than from ``vars()``: the corroboration is a
+        value object, and a serialiser that reaches into ``__dict__`` would hand a
+        caller something it cannot encode or compare.
+        """
+        return {
+            "claim_id": self.claim_id,
+            "subject": self.subject,
+            "attribute": self.attribute,
+            "value": self.value,
+            "author": self.author,
+            "observer": self.observer,
+            "device_id": self.device_id,
+            "observed_at": self.observed_at,
+            "source_class": self.source_class,
+            "trust": self.trust,
+            "residency": self.residency,
+            "reason": self.reason,
+            "corroborations": self.corroborations,
+            "stale": self.stale,
+            "corroboration": (
+                self.corroboration.to_payload() if self.corroboration else None
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -460,7 +606,25 @@ class ConflictSide:
 
     claim: CitedClaim
     supporters: int
+    """Claims on this device asserting the same value, this one included.
+
+    The claim count, unchanged and still the raw figure. ``corroboration`` says
+    how many of those are independent, which is the number that decides whether
+    agreement is real.
+    """
+
     entitling: bool
+    corroboration: Corroboration | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "claim": self.claim.to_payload(),
+            "supporters": self.supporters,
+            "entitling": self.entitling,
+            "corroboration": (
+                self.corroboration.to_payload() if self.corroboration else None
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -511,15 +675,21 @@ class Verdict:
             "subject": self.subject,
             "question": self.question,
             "summary": self.summary,
-            "claims": [vars(c) for c in self.claims],
+            "claims": [c.to_payload() for c in self.claims],
             "conflicts": [
                 {
-                    "a": vars(a.claim),
+                    "a": a.claim.to_payload(),
                     "a_supporters": a.supporters,
                     "a_entitling": a.entitling,
-                    "b": vars(b.claim),
+                    "b": b.claim.to_payload(),
                     "b_supporters": b.supporters,
                     "b_entitling": b.entitling,
+                    "a_corroboration": (
+                        a.corroboration.to_payload() if a.corroboration else None
+                    ),
+                    "b_corroboration": (
+                        b.corroboration.to_payload() if b.corroboration else None
+                    ),
                 }
                 for a, b in self.conflicts
             ],

@@ -15,6 +15,7 @@ from edgemem.domain import (
     CitedClaim,
     Claim,
     ConflictSide,
+    Corroboration,
     Ladder,
     NeededClaim,
     Residency,
@@ -40,6 +41,7 @@ from edgemem.sync import (
     SyncReport,
     VendorSnapshotUnavailable,
 )
+from edgemem.trust import DEFAULT_TRUST_POLICY, TrustDecision, TrustPolicy
 
 __all__ = [
     "AuthorityClass",
@@ -48,7 +50,9 @@ __all__ = [
     "CitedClaim",
     "Claim",
     "ConflictSide",
+    "Corroboration",
     "DEFAULT_PACK",
+    "DEFAULT_TRUST_POLICY",
     "Depot",
     "DeviceLink",
     "Ladder",
@@ -63,6 +67,8 @@ __all__ = [
     "SyncPath",
     "SyncReport",
     "Trust",
+    "TrustDecision",
+    "TrustPolicy",
     "UNBOUND_CITATION",
     "VendorSnapshotUnavailable",
     "Verdict",
