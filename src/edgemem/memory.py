@@ -22,6 +22,12 @@ a bare count is not the same as agreement: where each claim came from, and how
 much of the apparent backing for it comes from a source other than its own. A
 rumour written down four times is one voice that got louder, and a verdict that
 reported only "three supporting claims" would have called it a chorus.
+
+And one thing the device notices without being asked: when a claim arrives that
+makes an answer it has already given stale, ``pending_corrections()`` says so. It
+is a notice and not an answer — no verdict, no summary, no query — because an
+operator handed a CORRECTED verdict they had not requested could not tell the
+device's awareness apart from the seam having been used twice.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from edgemem.domain import (
     Corroboration,
     Ladder,
     NeededClaim,
+    PendingCorrection,
     Residency,
     ResidencyReason,
     Trust,
@@ -63,6 +70,7 @@ __all__ = [
     "AnswerLog",
     "EdgeMemory",
     "Ladder",
+    "PendingCorrection",
     "TrustPolicy",
     "default_ladder",
 ]
@@ -82,9 +90,42 @@ class AnswerLog:
 
     entries: dict[tuple[str, str], str] = field(default_factory=dict)
     _cited: dict[tuple[str, str], frozenset[str]] = field(default_factory=dict)
+    _unanswered: set[tuple[str, str]] = field(default_factory=set)
+    _seen_claims: set[str] = field(default_factory=set)
 
     def previous(self, subject: str, question: str) -> str | None:
         return self.entries.get((subject, question.strip().lower()))
+
+    def mark_unanswered(self, subject: str, question: str) -> None:
+        """Record that the device could not answer this at all.
+
+        So that learning enough to answer later is reportable as a correction,
+        rather than as a first answer that happens to be confident.
+        """
+        key = (subject, question.strip().lower())
+        self._unanswered.add(key)
+        self.entries.setdefault(key, "")
+
+    def was_unresolved(self, subject: str, question: str) -> bool:
+        return (subject, question.strip().lower()) in self._unanswered
+
+    def learned_since_last_ask(self, subject: str, question: str) -> bool:
+        """True when a claim this device had not seen is now backing the answer.
+
+        The transition that matters: the device could not answer, and now can.
+        Being able to answer is not news; becoming able to answer is.
+        """
+        key = (subject, question.strip().lower())
+        cited = self._cited.get(key, frozenset())
+        return bool(cited - self._seen_claims)
+
+    def note_known(self, claim_ids: Iterable[str]) -> None:
+        """Record which claims the device already had, before answering."""
+        self._seen_claims.update(claim_ids)
+
+    def clear_unanswered(self, subject: str, question: str) -> None:
+        """The device can answer this now, so it is no longer outstanding."""
+        self._unanswered.discard((subject, question.strip().lower()))
 
     def previous_cited(self, subject: str, question: str) -> frozenset[str]:
         """The claim ids behind the previous answer, or empty if there was none."""
@@ -143,6 +184,10 @@ class EdgeMemory:
         self.log = AnswerLog()
         self._context_note: dict[str, ResidencyReason] = {}
         self._depot_known: set[str] = set()
+        # Claims this device has taken in — recorded here, or absorbed from the
+        # depot — and which some answer it has already given does not yet stand
+        # behind. See :meth:`pending_corrections`.
+        self._taken_in: set[str] = set()
         self._write_gate = threading.RLock()
         self._writes = 0
         self.recovered = self._recover()
@@ -175,6 +220,7 @@ class EdgeMemory:
                 self.outbox.enqueue(claim)
             self.store.upsert([claim])
         self._context_note.pop(claim.claim_id, None)
+        self._taken_in.add(claim.claim_id)
         self._writes += 1
         return claim
 
@@ -261,6 +307,7 @@ class EdgeMemory:
             self.store.upsert(claims)
         for claim in claims:
             self._context_note.pop(claim.claim_id, None)
+            self._taken_in.add(claim.claim_id)
         return claims
 
     def _recover(self) -> list[Claim]:
@@ -367,16 +414,20 @@ class EdgeMemory:
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
 
-        rows, elapsed = self.store.search(question, limit=8)
+        found = self.store.traced_search(question, limit=8)
         latency = (time.perf_counter() - started) * 1000
-        paths = tuple(sorted({p for _, _, p in rows}))
+        paths = found.paths
+        # Which leg returned which claim. Measured by the store, not inferred from
+        # the fused score, so a citation can say that a claim surfaced on the
+        # keyword leg alone rather than only that a hybrid query ran.
+        by_claim = {hit.claim.claim_id: hit.legs for hit in found.hits}
 
         # An answer must be about the attribute being asked for. A claim about
         # one aspect of a subject is not an answer to a question about another,
         # and treating it as one is the confident-wrong-answer failure the
         # device exists to avoid.
         attribute = self._attribute_for(question, subject)
-        usable = [c for c, _, _ in rows if c.subject == subject]
+        usable = [hit.claim for hit in found.hits if hit.claim.subject == subject]
         if attribute is not None:
             usable = [c for c in usable if c.attribute == attribute]
         usable = [c for c in usable if self._is_answerable(c)]
@@ -392,7 +443,10 @@ class EdgeMemory:
             )
         cited = tuple(
             CitedClaim.of(
-                c, self.residency_of(c), self._corroboration(c, agreeing[_agreement_key(c)])
+                c,
+                self.residency_of(c),
+                self._corroboration(c, agreeing[_agreement_key(c)]),
+                paths=by_claim.get(c.claim_id, ()),
             )
             for c in usable
         )
@@ -400,7 +454,14 @@ class EdgeMemory:
 
         if conflicts:
             return self._conflicted(
-                subject, question, conflicts, cited, latency, paths, withheld_bytes
+                subject,
+                question,
+                conflicts,
+                cited,
+                latency,
+                paths,
+                withheld_bytes,
+                by_claim,
             )
         if cited:
             verdict = Verdict(
@@ -427,7 +488,10 @@ class EdgeMemory:
                 citation=self.pack.citation,
             )
             previous = self.log.previous(subject, question)
-            if previous is not None and previous != verdict.summary:
+            was_unresolved = self.log.was_unresolved(subject, question)
+            if (previous is not None and previous != verdict.summary) or (
+                was_unresolved and self.log.learned_since_last_ask(subject, question)
+            ):
                 # Compute the cause against the previous answer's claims before
                 # recording this one, which is what overwrites them.
                 cause = self.log.changed_by(subject, question, usable)
@@ -446,8 +510,10 @@ class EdgeMemory:
                     citation=self.pack.citation,
                 )
             self.log.record(subject, question, verdict.summary, usable)
+            self.log.clear_unanswered(subject, question)
             return verdict
 
+        self.log.mark_unanswered(subject, question)
         return Verdict(
             kind=VerdictKind.UNRESOLVED_CLOUD_REQUIRED,
             subject=subject,
@@ -490,7 +556,9 @@ class EdgeMemory:
         latency: float,
         paths: tuple[str, ...],
         withheld_bytes: int,
+        by_claim: dict[str, tuple[str, ...]] | None = None,
     ) -> Verdict:
+        by_claim = by_claim or {}
         sides: list[ConflictSide] = []
         for left, right in conflicts:
             left_agreeing = self._agreements(left)
@@ -499,11 +567,13 @@ class EdgeMemory:
                 left,
                 self.residency_of(left),
                 self._corroboration(left, left_agreeing),
+                paths=by_claim.get(left.claim_id, ()),
             )
             b = CitedClaim.of(
                 right,
                 self.residency_of(right),
                 self._corroboration(right, right_agreeing),
+                paths=by_claim.get(right.claim_id, ()),
             )
             a_rank = self.ladder.rank(left.source_class)
             b_rank = self.ladder.rank(right.source_class)
@@ -765,6 +835,54 @@ class EdgeMemory:
 
     # -- inspection --------------------------------------------------------
 
+    def pending_corrections(self) -> tuple[PendingCorrection, ...]:
+        """Answers this device has already given that its memory has moved past.
+
+        **Why this exists.** A CORRECTED verdict can only be produced by comparing
+        a question against a previous answer to the same question, so without this
+        the operator who has to know would have to ask again in order to find out
+        that asking again would have helped. That is the awareness the device has
+        of its own staleness doing the operator's job for them.
+
+        **What it does not do.** It does not ask anything. It reads the answer
+        log, reads the claims on the shard, and reports the difference; it issues
+        no retrieval query, renders no summary, and returns no verdict. A caller
+        that has not asked is told that its answer is stale, not handed a new one,
+        so nothing here can be mistaken for the seam having been used twice.
+
+        **What counts as stale.** A claim the device took in — recorded here, or
+        absorbed from the depot — that belongs to the same subject and the same
+        aspect the question was narrowed to, that the device could answer from,
+        and that is not already behind the recorded answer. The narrowing is the
+        one :meth:`ask` applies, so a claim about another aspect does not make an
+        answer stale.
+
+        **How it clears.** Asking the question again records those claims behind
+        the new answer and the entry disappears. There is no acknowledgement to
+        forget and nothing to clear by hand.
+        """
+        outstanding: list[PendingCorrection] = []
+        for (subject, question), summary in self.log.entries.items():
+            attribute = self._attribute_for(question, subject)
+            arrived = tuple(
+                c.claim_id
+                for c in self.store.claims_for(subject)
+                if c.claim_id in self._taken_in
+                and c.claim_id not in self.log.previous_cited(subject, question)
+                and (attribute is None or c.attribute == attribute)
+                and self._is_answerable(c)
+            )
+            if arrived:
+                outstanding.append(
+                    PendingCorrection(
+                        subject=subject,
+                        question=question,
+                        previous_summary=summary,
+                        claim_ids=arrived,
+                    )
+                )
+        return tuple(outstanding)
+
     def memory(self) -> list[Claim]:
         return self.store.all_claims()
 
@@ -789,6 +907,8 @@ class EdgeMemory:
                 c.value for c in self.trust.held_classes
             ),
             "trust_entitlement_floor": self.trust.entitlement_floor,
+            "pending_corrections": len(self.pending_corrections()),
+            "answered_questions": len(self.log.entries),
         }
 
 

@@ -190,12 +190,20 @@ def test_a_held_claim_does_not_answer_beside_a_trusted_one(device):
 
 
 def test_releasing_a_held_claim_makes_it_answer(device):
+    """Releasing a held claim changes the device's answer, so it is CORRECTED.
+
+    Not ANSWERED_LOCALLY: the device could not answer before, and becoming able
+    to answer is exactly the transition the CORRECTED verdict exists to report.
+    A supervisor vouched for the claim, and that is now visible to the operator.
+    """
     held = device.record(rumour())
     assert ask(device).kind.value == "UNRESOLVED_CLOUD_REQUIRED"
 
     released = device.release([held.claim_id], reason="supervisor vouched for it")
 
     assert [c.claim_id for c in released] == [held.claim_id]
+    assert ask(device).kind.value == "CORRECTED"
+    # Asked again with nothing new to learn, it settles.
     assert ask(device).kind.value == "ANSWERED_LOCALLY"
     on_record = device.memory()[0]
     assert on_record.was_released()

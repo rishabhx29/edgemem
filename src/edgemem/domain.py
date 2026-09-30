@@ -534,11 +534,21 @@ class CitedClaim:
     leave a reader to assume the number above was the whole story.
     """
 
+    paths: tuple[str, ...] = ()
+    """Which retrieval paths returned this claim: ``dense``, ``keyword``, or both.
+
+    Measured by running each leg of the query on its own and attributing the
+    claim to the legs that produced it. Empty only on a claim built outside a
+    retrieval — a conflict side assembled by hand, say — where there is no query
+    to attribute it to.
+    """
+
     @staticmethod
     def of(
         claim: Claim,
         residency: ResidencyReason,
         corroboration: Corroboration | None = None,
+        paths: tuple[str, ...] = (),
     ) -> "CitedClaim":
         return CitedClaim(
             claim_id=claim.claim_id,
@@ -557,6 +567,7 @@ class CitedClaim:
                 corroboration.agreeing_claims if corroboration else 1
             ),
             corroboration=corroboration,
+            paths=tuple(paths),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -581,6 +592,7 @@ class CitedClaim:
             "reason": self.reason,
             "corroborations": self.corroborations,
             "stale": self.stale,
+            "paths": list(self.paths),
             "corroboration": (
                 self.corroboration.to_payload() if self.corroboration else None
             ),
@@ -641,6 +653,48 @@ class NeededClaim:
 
 
 @dataclass(frozen=True)
+class PendingCorrection:
+    """An answer this device has already given that no longer reflects its memory.
+
+    **A notice, not an answer.** It names a question, the summary the device
+    stood behind last time it was asked, and the claims that have since arrived
+    about the same subject and aspect. It deliberately carries no new answer and
+    no verdict kind, because producing one would mean answering a question nobody
+    asked — and an operator who was handed a CORRECTED verdict they did not
+    request could not tell the difference between the device noticing something
+    and the device having been asked twice.
+
+    The entry disappears on its own once the question is asked again: the claims
+    it named are then behind the recorded answer, so nothing is outstanding. No
+    acknowledgement call is needed, and none is possible to forget.
+    """
+
+    subject: str
+    question: str
+    previous_summary: str
+    """The answer the device gave last time this question was asked."""
+
+    claim_ids: tuple[str, ...]
+    """Claims taken in since that answer, which are not behind it."""
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "subject": self.subject,
+            "question": self.question,
+            "previous_summary": self.previous_summary,
+            "claim_ids": list(self.claim_ids),
+        }
+
+    def render(self) -> str:
+        arrivals = ", ".join(cid[:8] for cid in self.claim_ids)
+        return (
+            f"the answer already given about {self.subject} is out of date: "
+            f"{len(self.claim_ids)} claim(s) about it have arrived since "
+            f"({arrivals})"
+        )
+
+
+@dataclass(frozen=True)
 class Verdict:
     """The single output of the question interface.
 
@@ -659,7 +713,16 @@ class Verdict:
     previous_summary: str | None = None
     changed_by: str | None = None
     latency_ms: float = 0.0
+    """Measured off the clock around this question, never modelled."""
+
     paths_used: tuple[str, ...] = ()
+    """The retrieval paths this question ran: ``dense`` and ``keyword``, or
+    whichever one was run alone.
+
+    A statement about the query, not about its results — a question that matched
+    nothing still ran both paths. Which *claims* came from which path is on each
+    citation, as :attr:`CitedClaim.paths`.
+    """
     bytes_withheld: int = 0
     citation: str = ""
     """The provision this record is being kept under.

@@ -30,6 +30,12 @@ from edgemem.domain import Claim, Trust
 DENSE = ""
 KEYWORD = "kw"
 
+# The two retrieval paths, named for the report rather than for the slot. A slot
+# name is the substrate's vocabulary; these are the engine's, and they are what a
+# verdict shows an operator.
+DENSE_PATH = "dense"
+KEYWORD_PATH = "keyword"
+
 
 class PointIdCollision(RuntimeError):
     """Two distinct claim ids resolved to one storage point.
@@ -87,6 +93,40 @@ class IndexState:
             f"scanning ({self.indexed_vectors}/{self.points} indexed, "
             f"{self.segments} segments)"
         )
+
+
+@dataclass(frozen=True)
+class RetrievalHit:
+    """One retrieved claim, and the retrieval paths it came back from.
+
+    ``legs`` is measured, not inferred from the score: each leg is run on its own
+    and the claim is attributed to the ones that returned it. The fused score
+    carries no record of which prefetch produced a point, so an attribution
+    derived from it would be a guess wearing a number.
+    """
+
+    claim: Claim
+    score: float
+    path: str
+    """The mechanism that retrieved it: ``hybrid``, ``dense`` or ``keyword``."""
+
+    legs: tuple[str, ...] = ()
+    """The paths that returned this claim, in the order they were run."""
+
+
+@dataclass(frozen=True)
+class Retrieval:
+    """What one retrieval ran, what it found, and what it cost.
+
+    ``paths`` names the legs the request issued, which is a fact about the query
+    rather than about its results: a query that found nothing still ran both
+    paths, and a report that said otherwise would be describing the hits rather
+    than the search.
+    """
+
+    hits: tuple[RetrievalHit, ...]
+    elapsed_ms: float
+    paths: tuple[str, ...]
 
 
 class ShardStore:
@@ -294,54 +334,109 @@ class ShardStore:
         """Retrieve with both paths, fused natively.
 
         Returns ``((claim, score, path), ...)`` together with the elapsed
-        milliseconds. The library performs the fusion; this method only reports
-        which paths contributed.
+        milliseconds, where ``path`` is the mechanism that retrieved the claim.
+        The library performs the fusion; nothing here combines a score.
+
+        A thin projection of :meth:`traced_search`, and it pays for the same
+        attribution pass that one does — see that method for what the extra
+        requests are and are not for.
+        """
+        found = self.traced_search(
+            text, limit=limit, use_dense=use_dense, use_keyword=use_keyword
+        )
+        return [(h.claim, h.score, h.path) for h in found.hits], found.elapsed_ms
+
+    def traced_search(
+        self,
+        text: str,
+        limit: int = 5,
+        use_dense: bool = True,
+        use_keyword: bool = True,
+    ) -> Retrieval:
+        """Retrieve, fused by the library, and say which path returned each claim.
+
+        **The ranking and the scores come from the fused request and from nowhere
+        else.** One request is issued, carrying both prefetches and
+        ``Fusion.Rrf``, and its rows are what is returned, unchanged. No score is
+        combined, weighted or reordered in Python.
+
+        **The two single-leg requests that follow are attribution only.** A fused
+        score does not record which prefetch produced a point, so "which claims
+        came from each path" is answered by running each leg on its own and seeing
+        which claims it returns. They are issued with ``with_payload=False``
+        because only the point ids are wanted, they cannot affect what was
+        returned, and the engine's fusion remains the only thing that decided the
+        order.
+
+        The legs run at the same ``limit`` as the prefetches they mirror, which
+        makes the attribution complete rather than approximate: reciprocal rank
+        fusion admits a point only if some prefetch returned it, so every row in
+        the fused answer appears in at least one leg's answer.
         """
         started = time.perf_counter()
         with self._lock:
             shard = self._require()
+
+        dense_query = qdrant_edge.Query.Nearest(query=self._embed(text))
+        keyword_query = qdrant_edge.Query.Nearest(
+            query=self.bm25.embed_query(text), using=KEYWORD
+        )
+
         if use_dense and use_keyword:
             req = qdrant_edge.QueryRequest(
                 limit=limit,
                 prefetches=[
-                    qdrant_edge.Prefetch(
-                        limit=limit,
-                        query=qdrant_edge.Query.Nearest(query=self._embed(text)),
-                    ),
-                    qdrant_edge.Prefetch(
-                        limit=limit,
-                        query=qdrant_edge.Query.Nearest(
-                            query=self.bm25.embed_query(text), using=KEYWORD
-                        ),
-                    ),
+                    qdrant_edge.Prefetch(limit=limit, query=dense_query),
+                    qdrant_edge.Prefetch(limit=limit, query=keyword_query),
                 ],
                 query=qdrant_edge.Fusion.Rrf(k=2),
                 with_payload=True,
             )
+            legs = ((DENSE_PATH, dense_query), (KEYWORD_PATH, keyword_query))
             path = "hybrid"
         elif use_keyword:
             req = qdrant_edge.QueryRequest(
-                limit=limit,
-                query=qdrant_edge.Query.Nearest(
-                    query=self.bm25.embed_query(text), using=KEYWORD
-                ),
-                with_payload=True,
+                limit=limit, query=keyword_query, with_payload=True
             )
-            path = "keyword"
+            legs = ((KEYWORD_PATH, keyword_query),)
+            path = KEYWORD_PATH
         else:
             req = qdrant_edge.QueryRequest(
-                limit=limit,
-                query=qdrant_edge.Query.Nearest(query=self._embed(text)),
-                with_payload=True,
+                limit=limit, query=dense_query, with_payload=True
             )
-            path = "dense"
+            legs = ((DENSE_PATH, dense_query),)
+            path = DENSE_PATH
+
         results = shard.query(req)
-        elapsed = (time.perf_counter() - started) * 1000
-        out = [
-            (Claim.from_payload(str(res.id), dict(res.payload)), float(res.score), path)
+
+        contributed: dict[str, set[str]] = {}
+        if len(legs) > 1:
+            for name, leg_query in legs:
+                for rec in shard.query(
+                    qdrant_edge.QueryRequest(
+                        limit=limit, query=leg_query, with_payload=False
+                    )
+                ):
+                    contributed.setdefault(str(rec.id), set()).add(name)
+
+        hits = tuple(
+            RetrievalHit(
+                claim=Claim.from_payload(str(res.id), dict(res.payload)),
+                score=float(res.score),
+                path=path,
+                legs=tuple(
+                    name
+                    for name, _ in legs
+                    if name in contributed.get(str(res.id), ())
+                ),
+            )
             for res in results
-        ]
-        return out, elapsed
+        )
+        return Retrieval(
+            hits=hits,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            paths=tuple(name for name, _ in legs),
+        )
 
     def index_state(self) -> IndexState:
         with self._lock:
